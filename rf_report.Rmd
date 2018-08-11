@@ -1,0 +1,336 @@
+---
+title: Random Forest and SVM Analysis on Parkinsons Telemonitoring Data Set with the mlr package and others
+author: Joanna Majewska
+output:
+  html_document
+---
+
+<hr>
+## 1. Loading the required packages
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(e1071)
+library(data.table)
+library(randomForest)
+library(Rlof)
+library(mlr)
+library(mmpf)
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE, eval = TRUE, echo = FALSE}
+library(knitr)
+library(kableExtra)
+```
+<hr>
+## 2. Preliminary exploration of dataset
+The data was downloaded from the [UCI Machine Learning Repository](http://archive.ics.uci.edu/ml/datasets/Parkinsons+Telemonitoring). 
+Authored by: A Tsanas, MA Little, PE McSharry, LO Ramig (2009) Accurate telemonitoring of Parkinson?s disease progression by non-invasive speech tests, IEEE Transactions on Biomedical Engineering. 
+
+* **Loading the dataset** 
+
+```{r, message=FALSE, warning=FALSE}
+dataset <- read.csv("C:/Users/Admin/Desktop/rf_report/parkinsons_updrs.csv", header = TRUE)
+#setting of factor variables
+dataset$sex <- as.factor(dataset$sex)
+dataset$subject. <- as.factor(dataset$subject.)
+dataset <- as.data.table(dataset)
+#summary of all the columns
+sumcol <- summarizeColumns(dataset)
+```
+
+```{r, eval = TRUE, echo = FALSE}
+kable(sumcol) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height = "300px")
+```
+<br>
+
+```{r, message=FALSE, warning=FALSE}
+#average value of selected attributes for each patient, whose time since recruitment into the trial exceeded 90 days (patients in decreasing order according to total_UPDRS)
+meancol <- dataset[, lapply(.SD, mean), by = .(subject.), 
+                   .SDcols = c("test_time", "motor_UPDRS", "total_UPDRS", "Jitter...", "Shimmer",
+                               "NHR", "HNR", "RPDE", "DFA", "PPE")
+                   ][order(-total_UPDRS)
+                     ][test_time > 90]
+```
+
+```{r, eval = TRUE, echo = FALSE}
+kable(meancol) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height = "300px")
+```
+<br>
+
+* **Visualization of outliers for selected variables** 
+
+```{r, message=FALSE, warning=FALSE}
+dataset2 <- dataset[, c("NHR", "HNR", "RPDE", "DFA", "PPE")]
+outlier_scores <- lof(dataset2, k = 20)
+outliers <- order(outlier_scores, decreasing = T)[1:10]
+print(outliers)
+plot(density(outlier_scores))
+labels <- 1:nrow(dataset2)
+labels[-outliers] <- "."
+biplot(prcomp(dataset2), cex = .8, xlabs = labels)
+pch <- rep(".", nrow(dataset2))
+pch[outliers] <- "+"
+col <- rep("black", nrow(dataset2))
+col[outliers] <- "red"
+pairs(dataset2, pch = pch, col = col)
+```
+<hr>
+## 3. Random Forest using the mlr package
+* **Data standardization, creating a task and training the model** 
+
+```{r, eval = FALSE, echo = TRUE}
+dataset <- as.data.frame(dataset)
+#data standardization (with variance 1 and mean 0)
+dataset <- normalizeFeatures(dataset, target = "total_UPDRS")
+#creation of a task - prediction of the total_UPDRS variable
+park_task <- makeRegrTask(id = "parkinson", 
+                         data = dataset,
+                         target = "total_UPDRS",
+                         fixup.data = "no", 
+                         check.data = TRUE)
+#model training function - generating a random forest
+park_rf <- train("regr.randomForest", park_task)
+fitted <- predict(park_rf, park_task)
+#mean squared error of the model on the training set
+performance(fitted) 
+```
+
+```{r, eval = TRUE, echo = FALSE}
+load("rftuneparam.rda")
+load("park_task.rda")
+load("final_model.rda")
+load("svmtuneparam.rda")
+load("imp_values.rda")
+load("final_model2.rda")
+load("park_rf.rda")
+load("pdp.rda")
+load("park_benchmark.rda")
+load("pdp2.rda")
+load("trainset.rda")
+load("testset.rda")
+load("rf.rda")
+load("tune_out.rda")
+
+fitted <- predict(park_rf, park_task)
+performance(fitted)
+```
+
+* **Tuning hyperparameters** 
+
+```{r, eval = FALSE, echo = TRUE}
+rflearner <- makeLearner("regr.randomForest")
+#parameter set for a random forest (mtry and ntree)
+rfsetparam <- makeParamSet(
+  makeDiscreteParam("mtry", values = 1:5), 
+  makeDiscreteParam("ntree", values = seq(500, 1500, 200))
+)
+#searching for the best set (resampling method - cross validation with division of the set into 3 parts)
+rftuneparam <- tuneParams(rflearner, 
+                              resampling = cv3, 
+                              task = park_task, 
+                              par.set = rfsetparam, 
+                              control = makeTuneControlGrid())
+rftuneparam
+```
+
+```{r, eval = TRUE, echo = FALSE}
+rftuneparam
+```
+
+```{r, eval = TRUE, echo = TRUE}
+rftune_data <- generateHyperParsEffectData(rftuneparam)
+#data in the form of a graph
+plotHyperParsEffect(rftune_data, x = "ntree", y = "mtry", 
+                    z = "mse.test.mean",
+                    plot.type = "heatmap")
+#mean squared error for each layout of hyperparameters and training time of the model
+mse_time <- as.data.frame(rftuneparam$opt.path)
+mse_time
+```
+
+* **Learner's update and training the model with optimal hyperparameters** 
+
+```{r, eval = FALSE, echo = TRUE}
+rflearner <- setHyperPars(rflearner, par.vals = rftuneparam$x)
+final_model <- train(rflearner, park_task)
+```
+
+```{r, warning = FALSE, message = FALSE, eval = TRUE, echo = TRUE}
+#mean squared error of the model with optimal hyperparameters
+performance(predict(final_model, park_task))
+#analysis of model residuals
+plotResiduals(predict(final_model, park_task))
+plotResiduals(predict(final_model, park_task), type = "hist")
+```
+
+* **Constructing Partial Dependence Plots for all model variables and testing the significance of variables** 
+
+```{r, eval = FALSE, echo = TRUE}
+pdp <- generatePartialDependenceData(final_model, park_task)
+imp_values <- generateFilterValuesData(park_task, method = "cforest.importance")
+```
+
+```{r, eval = TRUE, echo = TRUE}
+#PDP for all model variables
+plotPartialDependence(pdp)
+#validity of variables based on a random forest built of conditional decision trees
+plotFilterValues(imp_values)
+```
+
+```{r, eval = FALSE, echo = TRUE}
+#Appendix - How to modify the task for the most important variables?
+
+#modification of the old task - only 7 variables in the model (the most important according to the previously determined criterion)
+filtered_ptf <- filterFeatures(task = park_task,
+                                     fval = imp_values,
+                                     abs = 7) 
+#variable selection for learner (resampling method - cross-validation)
+filter_lrn <- makeFeatSelWrapper("regr.randomForest",
+                                resampling = cv3,
+                                control = makeFeatSelControlRandom(max.features = 7),
+                                show.info = TRUE)
+filter_pt <- train(filter_lrn, park_task)
+#selected model variables and error on the test set
+getFeatSelResult(filter_pt)
+```
+<hr>
+## 4. Comparison of different models (lm, randomForest, SVM)
+
+```{r, eval = FALSE, echo = TRUE}
+#comparison of models (linear regression, random forest and svm)
+#resampling method - cross-validation with division of the set into 10 parts
+park_benchmark <- benchmark(makeLearners(c("lm", "randomForest", "svm"),
+                                         type = "regr"),
+                            resamplings = cv10, 
+                            park_task)
+```
+
+```{r, eval = TRUE, echo = TRUE}
+park_benchmark
+#average errors received on the test set
+#raw results
+plotBMRSummary(park_benchmark) 
+#distribution of errors
+plotBMRBoxplots(park_benchmark)
+```
+<hr>
+## 5. SVM (Support Vector Machines) using mlr package 
+
+```{r, eval = TRUE, echo = TRUE}
+svmlearner <- makeLearner("regr.svm")
+```
+
+* **Tuning hyperparameters** 
+
+```{r, eval = FALSE, echo = TRUE}
+#parameter set for a SVM (cost and gamma)
+svmsetparam <- makeParamSet(
+  makeNumericParam("cost", lower = -5, upper = 5,
+                   trafo = function(x) 2^x), 
+  makeNumericParam("gamma", lower = -5, upper = 5,
+                   trafo = function(x) 2^x))
+#searching for the best set and again, the resampling method is cross-validation
+svmtuneparam <- tuneParams(svmlearner, 
+                           resampling = cv3, 
+                           task = park_task, 
+                           par.set = svmsetparam, 
+                           control = makeTuneControlGrid()) 
+svmtuneparam
+```
+
+```{r, eval = TRUE, echo = FALSE}
+svmtuneparam
+```
+
+```{r, eval = TRUE, echo = TRUE}
+svmtune_data <- generateHyperParsEffectData(svmtuneparam)
+#data in the form of a graph
+plotHyperParsEffect(svmtune_data, x = "cost", y = "gamma", 
+                    z = "mse.test.mean",
+                    plot.type = "heatmap")
+#mean squared error graph depending on the number of iterations
+plotHyperParsEffect(svmtune_data, x = "mse.test.mean", y = "iteration")
+#mean squared error for each layout of hyperparameters and training time of the model
+mse_time2 <- as.data.frame(svmtuneparam$opt.path, trafo = TRUE)
+mse_time2[1:20,] #only the first 20 iterations
+#learners update
+svmlearner <- setHyperPars(svmlearner, par.vals = svmtuneparam$x)
+```
+
+* **Training the model with optimal hyperparameters** 
+
+```{r, eval = FALSE, echo = TRUE}
+#model training with optimal hyperparameters
+final_model2 <- train(svmlearner, park_task)
+```
+
+```{r, message = FALSE, warning = FALSE, eval = TRUE, echo = TRUE}
+#mean squared error of the model with optimal hyperparameters
+performance(predict(final_model2, park_task))
+#analysis of model residuals
+plotResiduals(predict(final_model2, park_task))
+plotResiduals(predict(final_model2, park_task), type = "hist")
+```
+
+* **Constructing Partial Dependence Plots for all model variables**
+
+```{r, eval = FALSE, echo = TRUE}
+pdp2 <- generatePartialDependenceData(final_model2, park_task)
+```
+
+```{r, eval = TRUE, echo = TRUE}
+#Partial Dependence Plots for all model variables
+plotPartialDependence(pdp2)
+```
+
+* **Additionally: comparison of the randomForest and SVM methods**
+
+```{r, eval = TRUE, echo = TRUE}
+comparision <- data.frame(method = c("randomForest", "svm"), 
+                          MSE = c(performance(predict(final_model, park_task)),
+                          performance(predict(final_model2, park_task))))
+comparision
+```
+<hr>
+## 6. A brief example of analysis without using the mlr package
+
+```{r, eval = FALSE, echo = TRUE}
+#generating a training and testing set
+ind <- sample(1:nrow(dataset), floor(0.7*nrow(dataset)))
+trainset <- dataset[ind, ]
+testset <- dataset[-ind, ]
+#generating a random forest with ntree = 500
+#do.trace - insight into the process of reducing the classification error
+rf <- randomForest(total_UPDRS ~., data = trainset, ntree = 500, do.trace = 25)
+```
+
+```{r, eval = TRUE, echo = FALSE}
+rf
+```
+
+```{r, eval = TRUE, echo = TRUE}
+#ranking of variables 
+importance(rf)
+#ranking of variables on the plot
+varImpPlot(rf) 
+pred <- predict(rf, testset, type = "class")
+#correlation between true values and the model's response (fitted values)
+cor(pred, testset$total_UPDRS)
+#mean squared error
+mean(abs(testset$total_UPDRS - pred))
+```
+
+```{r, eval = FALSE, echo = TRUE}
+#cross-validation (default cv10)
+tune.out = tune.randomForest(trainset[, -6], trainset[, 6], ntree = c(300, 400, 500))
+```
+
+```{r, eval = TRUE, echo = TRUE}
+#cross-validation errors
+summary(tune.out)
+plot(tune.out)
+```
